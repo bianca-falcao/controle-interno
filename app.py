@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import io
+import openpyxl
 
 # Configuração da Página
 st.set_page_config(page_title="Portal de Compliance", layout="wide")
@@ -196,4 +197,5 @@ if st.button("Processar Arquivos"):
             st.error(f"Ocorreu um erro: {e}")
             st.write("Dica: Verifique se os nomes das colunas nos arquivos correspondem ao esperado no código.")
     else:
+
         st.warning("Por favor, faça o upload de todos os 4 arquivos.")
