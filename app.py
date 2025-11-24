@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import re
 import io
-import openpyxl
 
 # Configuração da Página
 st.set_page_config(page_title="Portal de Compliance", layout="wide")
@@ -93,11 +92,8 @@ if st.button("Processar Arquivos"):
                 contratos['Fornecedor'] = contratos['Fornecedor'].astype(str)
                 agentes['Código'] = agentes['Código'].astype(str)
                 
-                # --- AQUI ESTÁ A CORREÇÃO PRINCIPAL ---
-                # Limpamos o CNPJ na base de Agentes
+
                 agentes['CNPJ_Limpo'] = agentes['CNPJ'].apply(limpar_documento)
-                
-                # Limpamos o CNPJ na base de Diligências
                 diligencias['CNPJ_Limpo'] = diligencias['CNPJ/CPF'].apply(limpar_documento)
                 
                 # Removemos duplicatas da diligencia para não duplicar linhas no merge
@@ -134,6 +130,10 @@ if st.button("Processar Arquivos"):
                 # ---------------------------------------------------------
                 cols_group_contrato = ['Contrato', 'Empreendimento', 'Fornecedor', 'Nome fantasia', 'CNPJ']
                 aba_contratos = contratos.groupby(cols_group_contrato)[cols_valores].sum().reset_index()
+                # Excluindo colunas valor_unitario, quantidade_saldo e quantidade
+                aba_contratos.drop(columns=['valor_unitario', 'quantidade_saldo', 'quantidade'], inplace=True)
+
+
 
                 # ---------------------------------------------------------
                 # ABA 3: Agrupada por Fornecedor
@@ -168,9 +168,14 @@ if st.button("Processar Arquivos"):
                 )
                 
                 # Limpeza final (remove colunas auxiliares)
-                aba_fornecedores.drop(columns=['_merge', 'CNPJ_Limpo'], inplace=True)
+                aba_fornecedores.drop(columns=['_merge', 'CNPJ_Limpo', 'valor_unitario', 'quantidade_saldo', 'quantidade'], inplace=True)
+
+
+
                 # Opcional: remover CNPJ_Limpo da detalhada se não quiser ver
-                # contratos.drop(columns=['CNPJ_Limpo'], inplace=True) 
+                contratos.drop(columns=['CNPJ_Limpo'], inplace=True) 
+
+                
 
                 # 6. Exportação
                 output = io.BytesIO()
@@ -197,5 +202,4 @@ if st.button("Processar Arquivos"):
             st.error(f"Ocorreu um erro: {e}")
             st.write("Dica: Verifique se os nomes das colunas nos arquivos correspondem ao esperado no código.")
     else:
-
         st.warning("Por favor, faça o upload de todos os 4 arquivos.")
