@@ -311,7 +311,7 @@ with aba[1]:
 
         return df_final
 
-    API_KEY = "SUA-API-KEY-AQUI"
+    API_KEY = st.secrets["API_KEY"]
     API_URL = "https://api.portaldatransparencia.gov.br/api-de-dados/peps"
     HEADERS = {"chave-api-dados": API_KEY}
 
@@ -392,3 +392,4 @@ with aba[1]:
 
         except Exception as e:
             st.error(f"Erro crítico: {e}")
+
