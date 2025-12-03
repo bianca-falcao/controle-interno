@@ -4,69 +4,264 @@ import re
 import io
 import requests
 import concurrent.futures
-import csv
+from typing import Optional, List, Dict, Any
 
+# ==============================================================================
+# CONFIGURAÇÃO DA PÁGINA E ESTILOS
+# ==============================================================================
+st.set_page_config(
+    page_title="Portal de Compliance & Controles Internos",
+    page_icon="🛡️",
+    layout="wide"
+)
 
-st.set_page_config(page_title="Portal de Compliance", layout="wide")
+# Constantes de API e Configuração
+API_PEP_URL = "https://api.portaldatransparencia.gov.br/api-de-dados/peps"
+TIMEOUT_API_SEGUNDOS = 10
+MAX_THREADS_API = 20
 
+# ==============================================================================
+# FUNÇÕES UTILITÁRIAS (HELPER FUNCTIONS)
+# ==============================================================================
 
-aba = st.tabs(["📊 Fornecedores sem Diligência", "🔎 Verificação de PEPs Incorporadora"])
+def extrair_numero_contrato(texto: str) -> Optional[str]:
+    """
+    Extrai o número do contrato de uma string padrão do relatório.
+    Padrão esperado: 'Contrato: 12345 ('
+    """
+    if isinstance(texto, str):
+        match_regex = re.search(r'Contrato:\s*(\d+)\s*\(', texto)
+        return match_regex.group(1) if match_regex else None
+    return None
 
+def extrair_nome_empreendimento(texto: str) -> Optional[str]:
+    """
+    Remove o código numérico inicial do nome do empreendimento.
+    Padrão esperado: '00000000000 - NOME DO EMPREENDIMENTO'
+    """
+    if isinstance(texto, str):
+        match_regex = re.search(r'^\d{11} - ', texto)
+        return texto.split(' - ')[1] if match_regex else None
+    return None
 
+def extrair_id_fornecedor(texto: str) -> Optional[str]:
+    """
+    Captura o ID do fornecedor no início da string de descrição.
+    Padrão esperado: 'Fornecedor: 12345 -'
+    """
+    if isinstance(texto, str):
+        match_regex = re.search(r'Fornecedor:\s*(\d+)\s*-', texto)
+        return match_regex.group(1) if match_regex else None
+    return None
 
-with aba[0]:
+def sanitizar_documento(valor: Any) -> str:
+    """
+    Remove caracteres não numéricos de CPF/CNPJ para padronização.
+    """
+    if pd.isna(valor):
+        return ""
+    return re.sub(r'\D', '', str(valor))
 
+def consultar_api_pep(cpf: str) -> str:
+    """
+    Consulta o CPF na API de Pessoas Expostas Politicamente (PEP) do Portal da Transparência.
+    Requer chave de API configurada no st.secrets.
+    """
+    # Validações iniciais básicas
+    if not cpf or str(cpf).lower() == 'nan':
+        return "CPF Não Informado"
+    
+    cpf_limpo = re.sub(r'\D', '', str(cpf))
+    
+    if cpf_limpo == '00000000000':
+        return "CPF Zerado (Inválido)"
+    if len(cpf_limpo) != 11:
+        return "CPF Inválido/Incompleto"
+
+    # Busca a chave de API de forma segura
+    try:
+        api_key = st.secrets["API_KEY"]
+    except Exception:
+        return "Erro: API_KEY não configurada"
+
+    headers = {"chave-api-dados": api_key}
+
+    try:
+        response = requests.get(
+            API_PEP_URL, 
+            headers=headers,
+            params={'cpf': cpf_limpo, 'pagina': 1}, 
+            timeout=TIMEOUT_API_SEGUNDOS
+        )
+
+        if response.status_code == 200:
+            # Se a lista retornada não for vazia, é PEP
+            return "Sim - PEP Identificado" if response.json() else "Não consta"
+        elif response.status_code == 404:
+            return "Não consta" 
+        elif response.status_code == 429:
+            return "Erro: Limite de requisições excedido"
+        elif response.status_code in [401, 403]:
+            return "Erro: Falha de Autenticação API"
+        else:
+            return f"Erro HTTP {response.status_code}"
+
+    except requests.exceptions.RequestException:
+        return "Erro de Conexão"
+
+def processar_parser_relatorio_complexo(arquivo_obj) -> pd.DataFrame:
+    """
+    Lê um relatório Excel hierárquico (não tabular) e transforma em DataFrame estruturado.
+    Identifica Empreendimento, Contrato e Partes (Cliente, Cônjuge, Participante).
+    """
+    lista_dados_estruturados = []
+    
+    try:
+        # Lê sem cabeçalho pois o arquivo é posicional/hierárquico
+        df_bruto = pd.read_excel(arquivo_obj, header=None)
+    except Exception as e:
+        st.error(f"Falha na leitura do Excel: {e}")
+        return pd.DataFrame()
+
+    # Variáveis de estado para manter contexto durante a iteração das linhas
+    empresa_atual = None
+    contrato_atual = None
+    data_contrato_atual = None
+
+    for index, linha in df_bruto.iterrows():
+        primeira_celula = str(linha[0]).strip() if pd.notna(linha[0]) else ""
+
+        # Detecção de mudança de contexto: Empreendimento
+        if "Empreendimento:" in primeira_celula:
+            if len(linha) > 1 and pd.notna(linha[1]):
+                empresa_atual = str(linha[1]).strip()
+            continue
+        
+        # Detecção de mudança de contexto: Contrato (identificado por ID numérico na col 0)
+        if primeira_celula.isdigit():
+            if len(linha) >= 5:
+                contrato_atual = str(linha[3]).strip() if pd.notna(linha[3]) else ""
+                
+                # Tratamento de data
+                data_bruta = linha[4]
+                if isinstance(data_bruta, pd.Timestamp):
+                    data_contrato_atual = data_bruta.strftime('%Y-%m-%d')
+                else:
+                    data_contrato_atual = str(data_bruta).strip() if pd.notna(data_bruta) else ""
+
+                nome_cliente = str(linha[1]).strip() if pd.notna(linha[1]) else ""
+                
+                lista_dados_estruturados.append({
+                    "Numero Contrato": contrato_atual,
+                    "Empreendimento": empresa_atual,
+                    "Nome da Parte": nome_cliente,
+                    "Tipo Parte": "CLIENTE PRINCIPAL",
+                    "CPF": None, # Será preenchido nas linhas subsequentes
+                    "Data Cadastro": data_contrato_atual
+                })
+            continue
+
+        # Detecção de partes relacionadas
+        if "Cônjuge:" in primeira_celula:
+            nome_conjuge = str(linha[1]).strip() if (len(linha) > 1 and pd.notna(linha[1])) else ""
+            lista_dados_estruturados.append({
+                "Numero Contrato": contrato_atual,
+                "Empreendimento": empresa_atual,
+                "Nome da Parte": nome_conjuge,
+                "Tipo Parte": "CONJUGE",
+                "CPF": None,
+                "Data Cadastro": data_contrato_atual
+            })
+            continue
+
+        if "Participante:" in primeira_celula:
+            nome_participante = str(linha[1]).strip() if (len(linha) > 1 and pd.notna(linha[1])) else ""
+            lista_dados_estruturados.append({
+                "Numero Contrato": contrato_atual,
+                "Empreendimento": empresa_atual,
+                "Nome da Parte": nome_participante,
+                "Tipo Parte": "PARTICIPANTE",
+                "CPF": None,
+                "Data Cadastro": data_contrato_atual
+            })
+            continue
+        
+        # Associação do CPF à última parte adicionada
+        if primeira_celula.startswith("CPF"):
+            if lista_dados_estruturados:
+                cpf_valor = str(linha[1]).strip() if (len(linha) > 1 and pd.notna(linha[1])) else ""
+                lista_dados_estruturados[-1]["CPF"] = cpf_valor
+            continue
+
+    df_estruturado = pd.DataFrame(lista_dados_estruturados)
+
+    if df_estruturado.empty:
+        return df_estruturado
+
+    # Limpeza final de dados
+    df_estruturado = df_estruturado[df_estruturado['Nome da Parte'] != ""]
+    
+    # Remoção de linhas de lixo/totais que podem ter sido capturadas
+    termos_ignorar = ["Clientes no Bloco", "Clientes no Empreendimento", "Clientes", "Total Clientes", "Total Geral"]
+    df_estruturado = df_estruturado[~df_estruturado['Nome da Parte'].astype(str).str.strip().isin(termos_ignorar)]
+    
+    # Lógica de Dedup: Mantém apenas um registro por CPF válido para economizar requisições API
+    # Mas mantém registros com CPFs inválidos/nulos para reportar erro manual
+    df_estruturado['cpf_temp_sanitizado'] = df_estruturado['CPF'].astype(str).str.replace(r'\D', '', regex=True)
+    
+    mask_cpf_problematico = (
+        (df_estruturado['cpf_temp_sanitizado'] == '') | 
+        (df_estruturado['cpf_temp_sanitizado'].isnull()) | 
+        (df_estruturado['cpf_temp_sanitizado'] == '00000000000') |
+        (df_estruturado['CPF'].astype(str).str.lower().str.contains('nan'))
+    )
+
+    df_invalidos = df_estruturado[mask_cpf_problematico] 
+    df_validos = df_estruturado[~mask_cpf_problematico]    
+    
+    # Remove duplicatas apenas dos válidos
+    df_validos = df_validos.drop_duplicates(subset=['cpf_temp_sanitizado'], keep='first')
+    
+    df_final = pd.concat([df_validos, df_invalidos], ignore_index=True)
+    df_final = df_final.drop(columns=['cpf_temp_sanitizado'])
+
+    return df_final
+
+# ==============================================================================
+# INTERFACE PRINCIPAL
+# ==============================================================================
+
+abas_navegacao = st.tabs(["📊 Fornecedores sem Diligência", "🔎 Verificação de PEPs (Incorporadora)"])
+
+# ------------------------------------------------------------------------------
+# ABA 1: FORNECEDORES
+# ------------------------------------------------------------------------------
+with abas_navegacao[0]:
     st.title("📊 Controle Interno - Fornecedores sem Diligência")
-    st.markdown("Faça o upload das quatro planilhas abaixo.")
+    st.markdown("Cruza dados financeiros com a base de *Due Diligence* para identificar contratos com Fornecedores não homologados.")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        file_contratos = st.file_uploader("Upload Contratos (.xlsx)", type="xlsx")
+        arquivo_contratos = st.file_uploader("Relatório de Contratos (.xlsx)", type="xlsx")
     with col2:
-        file_itens = st.file_uploader("Upload Itens (.xlsx)", type="xlsx")
+        arquivo_itens = st.file_uploader("Relatório de Itens (.xlsx)", type="xlsx")
     with col3:
-        file_agentes = st.file_uploader("Upload Agentes (.xlsx)", type="xlsx")
+        arquivo_agentes = st.file_uploader("Base de Agentes (.xlsx)", type="xlsx")
     with col4:
-        file_diligencias = st.file_uploader("Upload Diligências (.xlsx)", type="xlsx")
+        arquivo_diligencias = st.file_uploader("Controle de Diligências (.xlsx)", type="xlsx")
 
-
-    def extrair_contrato(texto):
-        if isinstance(texto, str):
-            r = re.search(r'Contrato:\s*(\d+)\s*\(', texto)
-            return r.group(1) if r else None
-        return None
-
-    def extrair_empreendimento(texto):
-        if isinstance(texto, str):
-            r = re.search(r'^\d{11} - ', texto)
-            return texto.split(' - ')[1] if r else None
-        return None
-
-    def extrair_fornecedor(texto):
-        if isinstance(texto, str):
-            r = re.search(r'Fornecedor:\s*(\d+)\s*-', texto)
-            return r.group(1) if r else None
-        return None
-
-    def limpar_documento(valor):
-        if pd.isna(valor):
-            return ""
-        return re.sub(r'\D', '', str(valor))
-
-
-    if st.button("Processar Arquivos"):
-
-        if file_contratos and file_itens and file_agentes and file_diligencias:
-
+    if st.button("Executar Cruzamento de Dados"):
+        if arquivo_contratos and arquivo_itens and arquivo_agentes and arquivo_diligencias:
             try:
-                with st.spinner("Processando arquivos..."):
+                with st.spinner("Normalizando dados e cruzando bases..."):
+                    # Carregamento
+                    df_contratos = pd.read_excel(arquivo_contratos)
+                    df_itens = pd.read_excel(arquivo_itens)
+                    df_agentes = pd.read_excel(arquivo_agentes)
+                    df_diligencias = pd.read_excel(arquivo_diligencias, sheet_name="DDR e BCK")
 
-                    contratos = pd.read_excel(file_contratos)
-                    itens = pd.read_excel(file_itens)
-                    agentes = pd.read_excel(file_agentes)
-                    diligencias = pd.read_excel(file_diligencias, sheet_name="DDR e BCK")
-
-                    contratos.rename(columns={
+                    # Padronização de Colunas (De: Layout Sistema ERP -> Para: Layout Interno)
+                    mapa_colunas_erp = {
                         '(a)': 'item_codigo',
                         '(b)': 'descricao_item',
                         '(c)': 'unid_medida',
@@ -75,321 +270,186 @@ with aba[0]:
                         '(f)': 'valor_total',
                         '(k = g - j)': 'quantidade_saldo',
                         '(l = i + k)': 'valor_saldo'
-                    }, inplace=True)
+                    }
+                    df_contratos.rename(columns=mapa_colunas_erp, inplace=True)
 
-                    contratos = contratos[~contratos['item_codigo'].astype(str).str.contains(
-                        'Total Geral:|Total do Projeto:|Exibir Apropriações dos Itens:|Parâmetros Selecionados|OCMEG',
-                        na=False
-                    )]
+                    # Limpeza de linhas de cabeçalho/rodapé do relatório
+                    filtro_lixo = 'Total Geral:|Total do Projeto:|Exibir Apropriações|Parâmetros Selecionados|OCMEG'
+                    df_contratos = df_contratos[~df_contratos['item_codigo'].astype(str).str.contains(filtro_lixo, na=False)]
 
-                    contratos['Contrato'] = contratos['item_codigo'].apply(extrair_contrato).ffill()
-                    contratos['Empreendimento'] = contratos['item_codigo'].apply(extrair_empreendimento).ffill()
-                    contratos['Fornecedor'] = contratos['descricao_item'].apply(extrair_fornecedor).ffill()
+                    # Preenchimento de dados hierárquicos (Forward Fill)
+                    df_contratos['Contrato_Ref'] = df_contratos['item_codigo'].apply(extrair_numero_contrato).ffill()
+                    df_contratos['Empreendimento_Ref'] = df_contratos['item_codigo'].apply(extrair_nome_empreendimento).ffill()
+                    df_contratos['ID_Fornecedor'] = df_contratos['descricao_item'].apply(extrair_id_fornecedor).ffill()
 
-                    drop_cols = ['(g = e - f)', '(h)', '(i)', '(j)',
-                                'Unnamed: 12', 'Unnamed: 13', 'Unnamed: 14', 'Unnamed: 15', 'Unnamed: 16']
+                    # Remoção de colunas de cálculo do Excel que não são necessárias
+                    cols_descarte = ['(g = e - f)', '(h)', '(i)', '(j)', 'Unnamed: 12', 'Unnamed: 13', 'Unnamed: 14', 'Unnamed: 15', 'Unnamed: 16']
+                    df_contratos = df_contratos.drop(columns=[c for c in cols_descarte if c in df_contratos.columns])
+                    
+                    # Remove linhas divisórias
+                    df_contratos = df_contratos[~df_contratos['item_codigo'].astype(str).str.contains('-', na=False)]
 
-                    contratos = contratos.drop(columns=[c for c in drop_cols if c in contratos.columns])
-                    contratos = contratos[~contratos['item_codigo'].astype(str).str.contains('-', na=False)]
+                    # Tipagem
+                    df_contratos['ID_Fornecedor'] = df_contratos['ID_Fornecedor'].astype(str)
+                    df_agentes['Código'] = df_agentes['Código'].astype(str)
 
-                    contratos['Fornecedor'] = contratos['Fornecedor'].astype(str)
-                    agentes['Código'] = agentes['Código'].astype(str)
+                    # Criação de chaves de cruzamento (CNPJ limpo)
+                    df_agentes['CNPJ_Sanitizado'] = df_agentes['CNPJ'].apply(sanitizar_documento)
+                    df_diligencias['CNPJ_Sanitizado'] = df_diligencias['CNPJ/CPF'].apply(sanitizar_documento)
+                    
+                    # Cria base única de diligências para evitar duplicatas no merge
+                    df_diligencias_unicas = df_diligencias[['CNPJ_Sanitizado']].drop_duplicates()
 
-                    agentes['CNPJ_Limpo'] = agentes['CNPJ'].apply(limpar_documento)
-                    diligencias['CNPJ_Limpo'] = diligencias['CNPJ/CPF'].apply(limpar_documento)
-
-                    diligencias_unicas = diligencias[['CNPJ_Limpo']].drop_duplicates()
-
-                    # Merge itens
-                    contratos = pd.merge(
-                        contratos,
-                        itens[['Cód.Item', 'Definição Item']],
+                    # 1. Enrich com descrição do Item
+                    df_contratos = pd.merge(
+                        df_contratos,
+                        df_itens[['Cód.Item', 'Definição Item']],
                         left_on='item_codigo',
                         right_on='Cód.Item',
                         how='left'
                     )
 
-                    # Merge agentes
-                    contratos = pd.merge(
-                        contratos,
-                        agentes[['Código', 'CNPJ', 'CNPJ_Limpo', 'Nome fantasia']],
-                        left_on='Fornecedor',
+                    # 2. Enrich com dados do Agente (Fornecedor)
+                    df_contratos = pd.merge(
+                        df_contratos,
+                        df_agentes[['Código', 'CNPJ', 'CNPJ_Sanitizado', 'Nome fantasia']],
+                        left_on='ID_Fornecedor',
                         right_on='Código',
                         how='left'
                     )
 
-                    cols_valores = ['valor_unitario', 'valor_total', 'valor_saldo',
-                                    'quantidade', 'quantidade_saldo']
+                    # Conversão numérica para agregações
+                    cols_monetarias = ['valor_unitario', 'valor_total', 'valor_saldo', 'quantidade', 'quantidade_saldo']
+                    for col in cols_monetarias:
+                        df_contratos[col] = pd.to_numeric(df_contratos[col], errors='coerce').fillna(0)
 
-                    for c in cols_valores:
-                        contratos[c] = pd.to_numeric(contratos[c], errors='coerce').fillna(0)
+                    # --- GERAÇÃO DE VISÕES (TABELAS) ---
 
-                    # Aba por contrato
-                    cols_group_contrato = ['Contrato', 'Empreendimento', 'Fornecedor', 'Nome fantasia', 'CNPJ']
-                    aba_contratos = contratos.groupby(cols_group_contrato)[cols_valores].sum().reset_index()
-                    aba_contratos.drop(columns=['valor_unitario', 'quantidade_saldo', 'quantidade'], inplace=True)
+                    # Visão 1: Agrupado por Contrato
+                    cols_group_contrato = ['Contrato_Ref', 'Empreendimento_Ref', 'ID_Fornecedor', 'Nome fantasia', 'CNPJ']
+                    df_visao_contratos = df_contratos.groupby(cols_group_contrato)[cols_monetarias].sum().reset_index()
+                    df_visao_contratos.drop(columns=['valor_unitario', 'quantidade_saldo', 'quantidade'], inplace=True)
 
-                    # Aba por fornecedor
-                    cols_group_fornecedor = ['Fornecedor', 'Nome fantasia', 'CNPJ', 'CNPJ_Limpo']
-                    aba_fornecedores = contratos.groupby(cols_group_fornecedor)[cols_valores].sum().reset_index()
+                    # Visão 2: Agrupado por Fornecedor (Foco do Compliance)
+                    cols_group_fornecedor = ['ID_Fornecedor', 'Nome fantasia', 'CNPJ', 'CNPJ_Sanitizado']
+                    df_visao_fornecedores = df_contratos.groupby(cols_group_fornecedor)[cols_monetarias].sum().reset_index()
 
-                    filtro_servicos = contratos[contratos['Definição Item'] == 'Serviços']
-                    soma_servicos = filtro_servicos.groupby('Fornecedor')['valor_total'].sum().reset_index()
-                    soma_servicos.rename(columns={'valor_total': 'Total_Apenas_Servicos'}, inplace=True)
+                    # Cálculo específico: Total gasto apenas com SERVIÇOS
+                    filtro_servicos = df_contratos[df_contratos['Definição Item'] == 'Serviços']
+                    soma_apenas_servicos = filtro_servicos.groupby('ID_Fornecedor')['valor_total'].sum().reset_index()
+                    soma_apenas_servicos.rename(columns={'valor_total': 'Total_Apenas_Servicos'}, inplace=True)
 
-                    aba_fornecedores = pd.merge(aba_fornecedores, soma_servicos, on='Fornecedor', how='left')
-                    aba_fornecedores['Total_Apenas_Servicos'] = aba_fornecedores['Total_Apenas_Servicos'].fillna(0)
+                    df_visao_fornecedores = pd.merge(df_visao_fornecedores, soma_apenas_servicos, left_on='ID_Fornecedor', right_on='ID_Fornecedor', how='left')
+                    df_visao_fornecedores['Total_Apenas_Servicos'] = df_visao_fornecedores['Total_Apenas_Servicos'].fillna(0)
 
-                    aba_fornecedores['Verificacao_20k_Servicos'] = aba_fornecedores['Total_Apenas_Servicos'].apply(
-                        lambda x: 'Atinge 20 mil' if x >= 20000 else 'Não atinge 20 mil'
+                    # Flag de Criticidade: Gastos > 20k
+                    df_visao_fornecedores['Flag_Risco_20k'] = df_visao_fornecedores['Total_Apenas_Servicos'].apply(
+                        lambda x: '⚠️ Atinge 20 mil' if x >= 20000 else 'Baixo Valor'
                     )
 
-                    aba_fornecedores = pd.merge(
-                        aba_fornecedores,
-                        diligencias_unicas,
-                        on='CNPJ_Limpo',
+                    # Cruzamento Final: O fornecedor tem diligência feita?
+                    df_visao_fornecedores = pd.merge(
+                        df_visao_fornecedores,
+                        df_diligencias_unicas,
+                        on='CNPJ_Sanitizado',
                         how='left',
                         indicator=True
                     )
-
-                    aba_fornecedores['Diligencias_Realizadas'] = aba_fornecedores['_merge'].apply(
-                        lambda x: 'Sim' if x == 'both' else 'Não'
+                    
+                    df_visao_fornecedores['Status_Diligencia'] = df_visao_fornecedores['_merge'].apply(
+                        lambda x: '✅ Realizada' if x == 'both' else '❌ Pendente'
                     )
 
-                    aba_fornecedores.drop(columns=['_merge', 'CNPJ_Limpo',
-                                                    'valor_unitario', 'quantidade_saldo', 'quantidade'], inplace=True)
+                    # Limpeza final para exportação
+                    df_visao_fornecedores.drop(columns=['_merge', 'CNPJ_Sanitizado', 'valor_unitario', 'quantidade_saldo', 'quantidade'], inplace=True)
+                    df_contratos.drop(columns=['CNPJ_Sanitizado'], inplace=True)
 
-                    contratos.drop(columns=['CNPJ_Limpo'], inplace=True)
+                    # Buffer de memória para download
+                    buffer_excel = io.BytesIO()
+                    with pd.ExcelWriter(buffer_excel, engine='openpyxl') as writer:
+                        df_contratos.to_excel(writer, sheet_name='Analitico_Detalhado', index=False)
+                        df_visao_contratos.to_excel(writer, sheet_name='Sintetico_Contratos', index=False)
+                        df_visao_fornecedores.to_excel(writer, sheet_name='Matriz_Compliance', index=False)
+                    
+                    buffer_excel.seek(0)
 
-                    # Exportação
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        contratos.to_excel(writer, sheet_name='Detalhado', index=False)
-                        aba_contratos.to_excel(writer, sheet_name='Por Contrato', index=False)
-                        aba_fornecedores.to_excel(writer, sheet_name='Por Fornecedor', index=False)
+                st.success("Auditoria processada com sucesso!")
+                st.download_button(
+                    label="📥 Baixar Relatório de Compliance Consolidado",
+                    data=buffer_excel,
+                    file_name="Relatorio_Compliance_Fornecedores.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
 
-                    output.seek(0)
-
-                st.success("Processamento concluído!")
-                st.download_button("📥 Baixar Excel Consolidado", data=output,
-                                   file_name="contratos_consolidado_final.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-                st.write("### Prévia da Aba Por Fornecedor")
-                st.dataframe(aba_fornecedores.head())
+                st.markdown("### 📋 Matriz de Riscos (Fornecedores)")
+                st.dataframe(df_visao_fornecedores.head(10))
 
             except Exception as e:
-                st.error(f"Erro: {e}")
-
+                st.error(f"Erro no processamento dos arquivos: {e}")
         else:
-            st.warning("Envie todos os 4 arquivos.")
+            st.warning("⚠️ Atenção: Todos os 4 arquivos são obrigatórios para o cruzamento de dados.")
 
-
-
-
-with aba[1]:
-
-    st.title("🔎 Verificação de Contratos e PEPs Incorporadora")
-
+# ------------------------------------------------------------------------------
+# ABA 2: VERIFICAÇÃO DE PEPs
+# ------------------------------------------------------------------------------
+with abas_navegacao[1]:
+    st.title("🔎 Verificação de PEPs (Incorporadora)")
     st.markdown("""
-    **Instruções:**
-    1. Envie a planilha de relatório bruto em **.XLSX**.
-    2. O sistema irá tratar os dados e remover duplicatas de CPFs válidos.
-    3. Em seguida, fará a consulta automática na API do Portal da Transparência.
+    **Objetivo:** Automatizar a verificação de Pessoas Expostas Politicamente (PEPs) em massa.
+    
+    **Fluxo:**
+    1. Upload do relatório bruto de clientes (XLSX).
+    2. Parser inteligente para estruturar dados hierárquicos e remover duplicatas.
+    3. Consulta automática na **API da Transparência**.
     """)
 
+    arquivo_bruto_pep = st.file_uploader("Upload Relatório de Clientes (.xlsx)", type=["xlsx"])
 
-    arquivo_bruto = st.file_uploader("Upload Relatório Bruto (.xlsx)", type=["xlsx"])
-
-
-    def processar_relatorio_xlsx(file_obj):
-        """
-        Lê o arquivo Excel binário, percorre as linhas para identificar
-        a estrutura hierárquica e remove duplicatas mantendo inválidos.
-        """
-        data = []
-        
-        try:
-            df_raw = pd.read_excel(file_obj, header=None)
-        except Exception as e:
-            st.error(f"Erro ao ler o arquivo Excel: {e}")
-            return pd.DataFrame()
-
-        current_emp = None
-        current_contract_num = None
-        current_contract_date = None
-
-        for index, row in df_raw.iterrows():
-            
-            col0 = str(row[0]).strip() if pd.notna(row[0]) else ""
-
-            if "Empreendimento:" in col0:
-                if len(row) > 1 and pd.notna(row[1]):
-                    current_emp = str(row[1]).strip()
-                continue
-            
-            if col0.isdigit():
-                if len(row) >= 5:
-                    current_contract_num = str(row[3]).strip() if pd.notna(row[3]) else ""
-                    
-                    raw_date = row[4]
-                    if isinstance(raw_date, pd.Timestamp):
-                        current_contract_date = raw_date.strftime('%Y-%m-%d')
-                    else:
-                        current_contract_date = str(raw_date).strip() if pd.notna(raw_date) else ""
-
-                    client_name = str(row[1]).strip() if pd.notna(row[1]) else ""
-                    
-                    data.append({
-                        "Numero Contrato": current_contract_num,
-                        "Empreendimento": current_emp,
-                        "Nome da Parte": client_name,
-                        "Tipo": "CLIENTE PRINCIPAL",
-                        "CPF": None,
-                        "Data Cadastro": current_contract_date
-                    })
-                continue
-
-            if "Cônjuge:" in col0:
-                spouse_name = str(row[1]).strip() if (len(row) > 1 and pd.notna(row[1])) else ""
-                data.append({
-                    "Numero Contrato": current_contract_num,
-                    "Empreendimento": current_emp,
-                    "Nome da Parte": spouse_name,
-                    "Tipo": "CONJUGE",
-                    "CPF": None,
-                    "Data Cadastro": current_contract_date
-                })
-                continue
-
-            if "Participante:" in col0:
-                part_name = str(row[1]).strip() if (len(row) > 1 and pd.notna(row[1])) else ""
-                data.append({
-                    "Numero Contrato": current_contract_num,
-                    "Empreendimento": current_emp,
-                    "Nome da Parte": part_name,
-                    "Tipo": "PARTICIPANTE",
-                    "CPF": None,
-                    "Data Cadastro": current_contract_date
-                })
-                continue
-            
-            if col0.startswith("CPF"):
-                if data:
-                    cpf_value = str(row[1]).strip() if (len(row) > 1 and pd.notna(row[1])) else ""
-                    data[-1]["CPF"] = cpf_value
-                continue
-
-
-        df = pd.DataFrame(data)
-
-        if df.empty:
-            return df
-
-        df = df[df['Nome da Parte'] != ""]
-        termos_indesejados = [
-            "Clientes no Bloco", 
-            "Clientes no Empreendimento", 
-            "Clientes",
-            "Total Clientes",
-            "Total Geral"
-        ]
-        df = df[~df['Nome da Parte'].astype(str).str.strip().isin(termos_indesejados)]
-        df['cpf_limpo_temp'] = df['CPF'].astype(str).str.replace(r'\D', '', regex=True)
-        mask_invalido = (
-            (df['cpf_limpo_temp'] == '') | 
-            (df['cpf_limpo_temp'].isnull()) | 
-            (df['cpf_limpo_temp'] == '00000000000') |
-            (df['CPF'].astype(str).str.lower().str.contains('nan'))
-        )
-
-        df_invalidos = df[mask_invalido] 
-        df_validos = df[~mask_invalido]    
-        df_validos = df_validos.drop_duplicates(subset=['cpf_limpo_temp'], keep='first')
-        df_final = pd.concat([df_validos, df_invalidos], ignore_index=True)
-        df_final = df_final.drop(columns=['cpf_limpo_temp'])
-
-        return df_final
-
-    API_KEY = st.secrets["API_KEY"]
-    API_URL = "https://api.portaldatransparencia.gov.br/api-de-dados/peps"
-    HEADERS = {"chave-api-dados": API_KEY}
-
-    def consulta_pep(cpf):
-        if not cpf or str(cpf).lower() == 'nan':
-            return "CPF Não Informado"
-        
-        cpf_limpo = re.sub(r'\D', '', str(cpf))
-        
-
-        if cpf_limpo == '00000000000':
-            return "CPF Zerado"
-
-        if len(cpf_limpo) != 11:
-             return "CPF Inválido/Incompleto"
-
-        try:
-            r = requests.get(API_URL, headers=HEADERS,
-                             params={'cpf': cpf_limpo, 'pagina': 1}, timeout=10)
-
-            if r.status_code == 200:
-                return "Sim" if r.json() else "Não"
-            if r.status_code == 404:
-                return "Não" 
-            if r.status_code == 429:
-                return "Erro 429 (Muitas requisições)"
-            if r.status_code in [401, 403]:
-                return "Erro API (Auth)"
-            return f"Erro {r.status_code}"
-
-        except:
-            return "Erro Conexão"
-
-
-    if st.button("Processar e Consultar PEPs"):
-
-        if arquivo_bruto is None:
-            st.warning("Envie o arquivo XLSX primeiro.")
+    if st.button("Iniciar Verificação em Lote"):
+        if arquivo_bruto_pep is None:
+            st.warning("Por favor, faça o upload do arquivo primeiro.")
             st.stop()
 
         try:
-            st.info("1/2 - Tratando planilha XLSX e removendo duplicatas...")
+            # Passo 1: Processamento Local
+            st.info("🔹 Fase 1/2: Estruturando dados e sanitizando CPFs...")
+            df_clientes_tratado = processar_parser_relatorio_complexo(arquivo_bruto_pep)
             
-            df_clientes = processar_relatorio_xlsx(arquivo_bruto)
-            
-            if df_clientes.empty:
-                st.error("Não foi possível extrair dados ou a planilha estava vazia.")
+            if df_clientes_tratado.empty:
+                st.error("O arquivo está vazio ou não segue o padrão esperado.")
                 st.stop()
             
-            qtd_total = len(df_clientes)
-            st.success(f"Base tratada: {qtd_total} registros para análise (Duplicatas válidas removidas).")
-            st.write("Prévia dos dados:", df_clientes.head())
-
-            st.info("2/2 - Consultando API do Governo...")
+            total_registros = len(df_clientes_tratado)
+            st.success(f"Base processada: {total_registros} registros únicos identificados para análise.")
             
-            lista_cpfs = df_clientes["CPF"].astype(str).tolist()
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-                resultados = list(ex.map(consulta_pep, lista_cpfs))
-
-            df_clientes["E_PEP"] = resultados
-
-            st.success("Consulta PEP concluída!")
-            st.dataframe(df_clientes)
-
-            output_pep = io.BytesIO()
-            with pd.ExcelWriter(output_pep, engine='openpyxl') as writer:
-                df_clientes.to_excel(writer, index=False, sheet_name="Resultado_PEP")
+            # Passo 2: Consulta Externa API
+            st.info("🔹 Fase 2/2: Consultando API do Governo Federal...")
             
-            output_pep.seek(0)
+            lista_cpfs_consulta = df_clientes_tratado["CPF"].astype(str).tolist()
+
+            # Processamento paralelo para acelerar chamadas de API (I/O Bound)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS_API) as executor:
+                resultados_api = list(executor.map(consultar_api_pep, lista_cpfs_consulta))
+
+            df_clientes_tratado["Status_PEP"] = resultados_api
+
+            st.success("✅ Processo Finalizado!")
+            st.dataframe(df_clientes_tratado)
+
+            # Exportação
+            buffer_excel_pep = io.BytesIO()
+            with pd.ExcelWriter(buffer_excel_pep, engine='openpyxl') as writer:
+                df_clientes_tratado.to_excel(writer, index=False, sheet_name="Analise_PEP")
+            
+            buffer_excel_pep.seek(0)
 
             st.download_button(
-                "📥 Baixar Resultado (Tratado + PEP)",
-                data=output_pep,
-                file_name="clientes_verificacao_pep.xlsx",
+                "📥 Baixar Relatório Final (PEP)",
+                data=buffer_excel_pep,
+                file_name="Resultado_Verificacao_PEP.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
         except Exception as e:
-            st.error(f"Erro crítico: {e}")
+            st.error(f"Ocorreu um erro crítico durante a execução: {e}")
 
