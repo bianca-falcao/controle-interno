@@ -231,14 +231,14 @@ def processar_parser_relatorio_complexo(arquivo_obj) -> pd.DataFrame:
 # INTERFACE PRINCIPAL
 # ==============================================================================
 
-abas_navegacao = st.tabs(["📊 Fornecedores sem Diligência", "🔎 Verificação de PEPs (Incorporadora)"])
+abas_navegacao = st.tabs(["📊 Fornecedores sem Diligência", "🔎 Verificação de PEPs"])
 
 # ------------------------------------------------------------------------------
 # ABA 1: FORNECEDORES
 # ------------------------------------------------------------------------------
 with abas_navegacao[0]:
-    st.title("📊 Controle Interno - Fornecedores sem Diligência")
-    st.markdown("Cruza dados financeiros com a base de *Due Diligence* para identificar contratos com Fornecedores não homologados.")
+    st.title("📊 Controle Interno - Auditoria de Fornecedores")
+    st.markdown("Cruza dados financeiros com a base de *Due Diligence* para identificar pagamentos a fornecedores não homologados.")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -390,66 +390,149 @@ with abas_navegacao[0]:
             st.warning("⚠️ Atenção: Todos os 4 arquivos são obrigatórios para o cruzamento de dados.")
 
 # ------------------------------------------------------------------------------
-# ABA 2: VERIFICAÇÃO DE PEPs
+# ABA 2: VERIFICAÇÃO DE PEPs (SEPARADO POR SETOR)
 # ------------------------------------------------------------------------------
 with abas_navegacao[1]:
-    st.title("🔎 Verificação de PEPs (Incorporadora)")
+    st.title("🔎 Consulta Unificada de PEPs")
+    st.info("Utilize as seções abaixo de acordo com a origem do arquivo (Incorporadora ou Automotivo). A consulta é feita na API do Portal da Transparência.")
+
+    # --------------------------------------------------------------------------
+    # SEÇÃO 1: INCORPORADORA (RELATÓRIO HIERÁRQUICO)
+    # --------------------------------------------------------------------------
+    st.subheader("🏢 Setor Incorporadora (Relatório ERP)")
     st.markdown("""
-    **Objetivo:** Automatizar a verificação de Pessoas Expostas Politicamente (PEPs) em massa.
-    
-    **Fluxo:**
-    1. Upload do relatório bruto de clientes (XLSX).
-    2. Parser inteligente para estruturar dados hierárquicos e remover duplicatas.
-    3. Consulta automática na **API da Transparência**.
+    **Layout esperado:** Relatório hierárquico complexo extraído do sistema ERP.  
+    O sistema irá tratar a estrutura, remover duplicatas e consultar os CPFs válidos.
     """)
 
-    arquivo_bruto_pep = st.file_uploader("Upload Relatório de Clientes (.xlsx)", type=["xlsx"])
+    arquivo_bruto_pep = st.file_uploader("Upload Relatório Incorporadora (.xlsx)", type=["xlsx"], key="upload_incorp")
 
-    if st.button("Iniciar Verificação em Lote"):
+    if st.button("Verificar Base Incorporadora", key="btn_incorp"):
         if arquivo_bruto_pep is None:
-            st.warning("Por favor, faça o upload do arquivo primeiro.")
-            st.stop()
+            st.warning("Por favor, faça o upload do arquivo da incorporadora primeiro.")
+        else:
+            try:
+                # Passo 1: Processamento Local
+                st.info("🔹 Fase 1/2: Estruturando dados e sanitizando CPFs...")
+                df_clientes_tratado = processar_parser_relatorio_complexo(arquivo_bruto_pep)
+                
+                if df_clientes_tratado.empty:
+                    st.error("O arquivo está vazio ou não segue o padrão esperado.")
+                else:
+                    total_registros = len(df_clientes_tratado)
+                    st.success(f"Base processada: {total_registros} registros únicos identificados.")
+                    
+                    # Passo 2: Consulta Externa API
+                    st.info("🔹 Fase 2/2: Consultando API do Governo Federal...")
+                    
+                    lista_cpfs_consulta = df_clientes_tratado["CPF"].astype(str).tolist()
 
-        try:
-            # Passo 1: Processamento Local
-            st.info("🔹 Fase 1/2: Estruturando dados e sanitizando CPFs...")
-            df_clientes_tratado = processar_parser_relatorio_complexo(arquivo_bruto_pep)
-            
-            if df_clientes_tratado.empty:
-                st.error("O arquivo está vazio ou não segue o padrão esperado.")
-                st.stop()
-            
-            total_registros = len(df_clientes_tratado)
-            st.success(f"Base processada: {total_registros} registros únicos identificados para análise.")
-            
-            # Passo 2: Consulta Externa API
-            st.info("🔹 Fase 2/2: Consultando API do Governo Federal...")
-            
-            lista_cpfs_consulta = df_clientes_tratado["CPF"].astype(str).tolist()
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS_API) as executor:
+                        resultados_api = list(executor.map(consultar_api_pep, lista_cpfs_consulta))
 
-            # Processamento paralelo para acelerar chamadas de API (I/O Bound)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS_API) as executor:
-                resultados_api = list(executor.map(consultar_api_pep, lista_cpfs_consulta))
+                    df_clientes_tratado["Status_PEP"] = resultados_api
 
-            df_clientes_tratado["Status_PEP"] = resultados_api
+                    st.success("✅ Verificação Incorporadora Finalizada!")
+                    st.dataframe(df_clientes_tratado)
 
-            st.success("✅ Processo Finalizado!")
-            st.dataframe(df_clientes_tratado)
+                    # Exportação
+                    buffer_excel_pep = io.BytesIO()
+                    with pd.ExcelWriter(buffer_excel_pep, engine='openpyxl') as writer:
+                        df_clientes_tratado.to_excel(writer, index=False, sheet_name="Analise_PEP")
+                    
+                    buffer_excel_pep.seek(0)
 
-            # Exportação
-            buffer_excel_pep = io.BytesIO()
-            with pd.ExcelWriter(buffer_excel_pep, engine='openpyxl') as writer:
-                df_clientes_tratado.to_excel(writer, index=False, sheet_name="Analise_PEP")
-            
-            buffer_excel_pep.seek(0)
+                    st.download_button(
+                        "📥 Baixar Relatório (Incorporadora)",
+                        data=buffer_excel_pep,
+                        file_name="Resultado_PEP_Incorporadora.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_incorp"
+                    )
 
-            st.download_button(
-                "📥 Baixar Relatório Final (PEP)",
-                data=buffer_excel_pep,
-                file_name="Resultado_Verificacao_PEP.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            except Exception as e:
+                st.error(f"Erro crítico: {e}")
 
-        except Exception as e:
-            st.error(f"Ocorreu um erro crítico durante a execução: {e}")
+    # Divisor visual entre as seções
+    st.markdown("---") 
+
+    # --------------------------------------------------------------------------
+    # SEÇÃO 2: AUTOMOTIVO (TABELA SIMPLES)
+    # --------------------------------------------------------------------------
+    st.subheader("🚗 Setor Automotivo (Planilha Simples)")
+    st.markdown("""
+    **Layout esperado:** Planilha Excel simples com as colunas obrigatórias:  
+    `CLIENTE`, `NOME`, `CPF` (sem formatação).
+    """)
+
+    arquivo_bruto_auto = st.file_uploader("Upload Base Automotiva (.xlsx)", type=["xlsx"], key="upload_auto")
+
+    if st.button("Verificar Base Automotiva", key="btn_auto"):
+        if arquivo_bruto_auto is None:
+            st.warning("Por favor, faça o upload do arquivo automotivo primeiro.")
+        else:
+            try:
+                st.info("🔹 Lendo arquivo e normalizando dados...")
+                
+                df_auto = pd.read_excel(arquivo_bruto_auto)
+                
+                # Normalização dos nomes das colunas (para evitar erro de case sensitivity)
+                df_auto.columns = [c.upper().strip() for c in df_auto.columns]
+                
+                colunas_esperadas = ['CLIENTE', 'NOME', 'CPF']
+                
+                # Validação de Colunas
+                if not all(col in df_auto.columns for col in colunas_esperadas):
+                    st.error(f"Erro de Layout. Colunas obrigatórias não encontradas: {colunas_esperadas}")
+                    st.write("Colunas encontradas:", list(df_auto.columns))
+                else:
+                    # Sanitização
+                    df_auto['CPF_Limpo'] = df_auto['CPF'].apply(sanitizar_documento)
+                    
+                    # Filtra apenas CPFs que parecem válidos (tamanho 11) para não gastar API à toa
+                    # Mas mantemos os inválidos no dataframe final marcados
+                    mask_cpf_valido = df_auto['CPF_Limpo'].str.len() == 11
+                    
+                    cpfs_para_consulta = df_auto.loc[mask_cpf_valido, 'CPF_Limpo'].tolist()
+                    
+                    st.info(f"🔹 Consultando {len(cpfs_para_consulta)} CPFs na API...")
+
+                    # Consulta API
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS_API) as executor:
+                        resultados_raw = list(executor.map(consultar_api_pep, cpfs_para_consulta))
+                    
+                    # Mapear resultados de volta para o DataFrame
+                    # Criamos um dicionário {cpf: resultado} para mapear com segurança
+                    mapa_resultados = dict(zip(cpfs_para_consulta, resultados_raw))
+                    
+                    df_auto['Status_PEP'] = df_auto['CPF_Limpo'].map(mapa_resultados).fillna("CPF Inválido/Formato Incorreto")
+
+                    st.success("✅ Verificação Automotiva Finalizada!")
+                    
+                    # Reordena colunas para visualização
+                    cols_final = ['CLIENTE', 'NOME', 'CPF', 'Status_PEP']
+                    # Adiciona colunas extras se houverem no arquivo original
+                    cols_extras = [c for c in df_auto.columns if c not in cols_final and c != 'CPF_Limpo']
+                    df_auto_final = df_auto[cols_final + cols_extras]
+
+                    st.dataframe(df_auto_final)
+
+                    # Exportação
+                    buffer_excel_auto = io.BytesIO()
+                    with pd.ExcelWriter(buffer_excel_auto, engine='openpyxl') as writer:
+                        df_auto_final.to_excel(writer, index=False, sheet_name="Analise_PEP_Auto")
+                    
+                    buffer_excel_auto.seek(0)
+
+                    st.download_button(
+                        "📥 Baixar Relatório (Automotivo)",
+                        data=buffer_excel_auto,
+                        file_name="Resultado_PEP_Automotivo.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_auto"
+                    )
+
+            except Exception as e:
+                st.error(f"Erro ao processar arquivo automotivo: {e}")
+
 
