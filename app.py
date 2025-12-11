@@ -237,8 +237,8 @@ abas_navegacao = st.tabs(["📊 Fornecedores sem Diligência", "🔎 Verificaç�
 # ABA 1: FORNECEDORES
 # ------------------------------------------------------------------------------
 with abas_navegacao[0]:
-    st.title("📊 Controle Interno - Auditoria de Fornecedores")
-    st.markdown("Cruza dados financeiros com a base de *Due Diligence* para identificar pagamentos a fornecedores não homologados.")
+    st.title("📊 Controle Interno - Fornecedores sem Diligência")
+    st.markdown("Cruza dados de contratos com a base de *Due Diligence* para identificar contratos com fornecedores não homologados.")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -373,7 +373,7 @@ with abas_navegacao[0]:
                     
                     buffer_excel.seek(0)
 
-                st.success("Auditoria processada com sucesso!")
+                st.success("Base processada com sucesso!")
                 st.download_button(
                     label="📥 Baixar Relatório de Compliance Consolidado",
                     data=buffer_excel,
@@ -399,7 +399,7 @@ with abas_navegacao[1]:
     # --------------------------------------------------------------------------
     # SEÇÃO 1: INCORPORADORA (RELATÓRIO HIERÁRQUICO)
     # --------------------------------------------------------------------------
-    st.subheader("🏢 Setor Incorporadora (Relatório ERP)")
+    st.subheader("🏢 Incorporadora (Relatório ERP)")
     st.markdown("""
     **Layout esperado:** Relatório hierárquico complexo extraído do sistema ERP.  
     O sistema irá tratar a estrutura, remover duplicatas e consultar os CPFs válidos.
@@ -459,7 +459,7 @@ with abas_navegacao[1]:
     # --------------------------------------------------------------------------
     # SEÇÃO 2: AUTOMOTIVO (TABELA SIMPLES)
     # --------------------------------------------------------------------------
-    st.subheader("🚗 Setor Automotivo (Planilha Simples)")
+    st.subheader("🚗 Automotivo (Planilha Simples)")
     st.markdown("""
     **Layout esperado:** Planilha Excel simples com as colunas obrigatórias:  
     `CLIENTE`, `NOME`, `CPF` (sem formatação).
@@ -534,5 +534,6 @@ with abas_navegacao[1]:
 
             except Exception as e:
                 st.error(f"Erro ao processar arquivo automotivo: {e}")
+
 
 
