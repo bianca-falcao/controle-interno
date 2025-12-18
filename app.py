@@ -72,11 +72,16 @@ def consultar_api_pep(cpf: str) -> str:
         return "CPF Não Informado"
     
     cpf_limpo = re.sub(r'\D', '', str(cpf))
-    
+
+    # Completa com zeros à esquerda até 11 dígitos
+    cpf_limpo = cpf_limpo.zfill(11)
+
+    # Validações pós-normalização
     if cpf_limpo == '00000000000':
         return "CPF Zerado (Inválido)"
     if len(cpf_limpo) != 11:
         return "CPF Inválido/Incompleto"
+
 
     # Busca a chave de API de forma segura
     try:
@@ -534,6 +539,7 @@ with abas_navegacao[1]:
 
             except Exception as e:
                 st.error(f"Erro ao processar arquivo automotivo: {e}")
+
 
 
 
