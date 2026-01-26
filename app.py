@@ -377,7 +377,6 @@ with abas_navegacao[0]:
 # ------------------------------------------------------------------------------
 with abas_navegacao[1]:
     st.title("🔎 Consulta Unificada de PEPs")
-    st.info("Utilize as seções abaixo. A consulta agora padroniza automaticamente CPFs com menos de 11 dígitos.")
 
     # --------------------------------------------------------------------------
     # SEÇÃO 1: INCORPORADORA
@@ -480,6 +479,7 @@ with abas_navegacao[1]:
 
             except Exception as e:
                 st.error(f"Erro: {e}")
+
 
 
 
