@@ -221,9 +221,156 @@ abas_navegacao = st.tabs(["📊 Fornecedores sem Diligência", "🔎 Verificaç�
 # ... (ABA 1 Mantida idêntica ao original, omitida para brevidade se não houve mudança lógica necessária lá) ...
 # Se precisar do código da Aba 1, avise, mas foquei na correção do PEP abaixo.
 with abas_navegacao[0]:
-    st.title("📊 Controle Interno - Fornecedores")
-    st.info("A lógica desta aba foi mantida. Foque na aba de Verificação de PEPs para as correções de CPF.")
-    # (Mantenha o código original da Aba 1 aqui)
+    st.title("📊 Controle Interno - Fornecedores sem Diligência")
+    st.markdown("Cruza dados de contratos com a base de *Due Diligence* para identificar contratos com fornecedores não homologados.")
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        arquivo_contratos = st.file_uploader("Relatório de Contratos (.xlsx)", type="xlsx")
+    with col2:
+        arquivo_itens = st.file_uploader("Relatório de Itens (.xlsx)", type="xlsx")
+    with col3:
+        arquivo_agentes = st.file_uploader("Base de Agentes (.xlsx)", type="xlsx")
+    with col4:
+        arquivo_diligencias = st.file_uploader("Controle de Diligências (.xlsx)", type="xlsx")
+
+    if st.button("Executar Cruzamento de Dados"):
+        if arquivo_contratos and arquivo_itens and arquivo_agentes and arquivo_diligencias:
+            try:
+                with st.spinner("Normalizando dados e cruzando bases..."):
+                    # Carregamento
+                    df_contratos = pd.read_excel(arquivo_contratos)
+                    df_itens = pd.read_excel(arquivo_itens)
+                    df_agentes = pd.read_excel(arquivo_agentes)
+                    df_diligencias = pd.read_excel(arquivo_diligencias, sheet_name="DDR e BCK")
+
+                    # Padronização de Colunas (De: Layout Sistema ERP -> Para: Layout Interno)
+                    mapa_colunas_erp = {
+                        '(a)': 'item_codigo',
+                        '(b)': 'descricao_item',
+                        '(c)': 'unid_medida',
+                        '(d)': 'quantidade',
+                        '(e)': 'valor_unitario',
+                        '(f)': 'valor_total',
+                        '(k = g - j)': 'quantidade_saldo',
+                        '(l = i + k)': 'valor_saldo'
+                    }
+                    df_contratos.rename(columns=mapa_colunas_erp, inplace=True)
+
+                    # Limpeza de linhas de cabeçalho/rodapé do relatório
+                    filtro_lixo = 'Total Geral:|Total do Projeto:|Exibir Apropriações|Parâmetros Selecionados|OCMEG'
+                    df_contratos = df_contratos[~df_contratos['item_codigo'].astype(str).str.contains(filtro_lixo, na=False)]
+                    # Preenchimento de dados hierárquicos (Forward Fill)
+                    df_contratos['Contrato_Ref'] = df_contratos['item_codigo'].apply(extrair_numero_contrato).ffill()
+                    df_contratos['Empreendimento_Ref'] = df_contratos['item_codigo'].apply(extrair_nome_empreendimento).ffill()
+                    df_contratos['ID_Fornecedor'] = df_contratos['descricao_item'].apply(extrair_id_fornecedor).ffill()
+
+                    # Remoção de colunas de cálculo do Excel que não são necessárias
+                    cols_descarte = ['(g = e - f)', '(h)', '(i)', '(j)', 'Unnamed: 12', 'Unnamed: 13', 'Unnamed: 14', 'Unnamed: 15', 'Unnamed: 16']
+                    df_contratos = df_contratos.drop(columns=[c for c in cols_descarte if c in df_contratos.columns])
+                    
+                    # Remove linhas divisórias
+                    df_contratos = df_contratos[~df_contratos['item_codigo'].astype(str).str.contains('-', na=False)]
+
+                    # Tipagem
+                    df_contratos['ID_Fornecedor'] = df_contratos['ID_Fornecedor'].astype(str)
+                    df_agentes['Código'] = df_agentes['Código'].astype(str)
+
+                    # Criação de chaves de cruzamento (CNPJ limpo)
+                    df_agentes['CNPJ_Sanitizado'] = df_agentes['CNPJ'].apply(sanitizar_documento)
+                    df_diligencias['CNPJ_Sanitizado'] = df_diligencias['CNPJ/CPF'].apply(sanitizar_documento)
+               
+                    # Cria base única de diligências para evitar duplicatas no merge
+                    df_diligencias_unicas = df_diligencias[['CNPJ_Sanitizado']].drop_duplicates()
+
+                    # 1. Enrich com descrição do Item
+                    df_contratos = pd.merge(
+                        df_contratos,
+                        df_itens[['Cód.Item', 'Definição Item']],
+                        left_on='item_codigo',
+                        right_on='Cód.Item',
+                        how='left'
+                    )
+
+                    # 2. Enrich com dados do Agente (Fornecedor)
+                    df_contratos = pd.merge(
+                        df_contratos,
+                        df_agentes[['Código', 'CNPJ', 'CNPJ_Sanitizado', 'Nome fantasia']],
+                        left_on='ID_Fornecedor',
+                        right_on='Código',
+                        how='left'
+                    )
+
+                    # Conversão numérica para agregações
+                    cols_monetarias = ['valor_unitario', 'valor_total', 'valor_saldo', 'quantidade', 'quantidade_saldo']
+                    for col in cols_monetarias:
+                        df_contratos[col] = pd.to_numeric(df_contratos[col], errors='coerce').fillna(0)
+
+                    # --- GERAÇÃO DE VISÕES (TABELAS) ---
+                    # Visão 1: Agrupado por Contrato
+                    cols_group_contrato = ['Contrato_Ref', 'Empreendimento_Ref', 'ID_Fornecedor', 'Nome fantasia', 'CNPJ']
+                    df_visao_contratos = df_contratos.groupby(cols_group_contrato)[cols_monetarias].sum().reset_index()
+                    df_visao_contratos.drop(columns=['valor_unitario', 'quantidade_saldo', 'quantidade'], inplace=True)
+
+                    # Visão 2: Agrupado por Fornecedor (Foco do Compliance)
+                    cols_group_fornecedor = ['ID_Fornecedor', 'Nome fantasia', 'CNPJ', 'CNPJ_Sanitizado']
+                    df_visao_fornecedores = df_contratos.groupby(cols_group_fornecedor)[cols_monetarias].sum().reset_index()
+
+                    # Cálculo específico: Total gasto apenas com SERVIÇOS
+
+                    filtro_servicos = df_contratos[df_contratos['Definição Item'] == 'Serviços']
+                    soma_apenas_servicos = filtro_servicos.groupby('ID_Fornecedor')['valor_total'].sum().reset_index()
+                    soma_apenas_servicos.rename(columns={'valor_total': 'Total_Apenas_Servicos'}, inplace=True)
+                    df_visao_fornecedores = pd.merge(df_visao_fornecedores, soma_apenas_servicos, left_on='ID_Fornecedor', right_on='ID_Fornecedor', how='left')
+                    df_visao_fornecedores['Total_Apenas_Servicos'] = df_visao_fornecedores['Total_Apenas_Servicos'].fillna(0)
+
+                    # Flag de Criticidade: Gastos > 20k
+
+                    df_visao_fornecedores['Flag_Risco_20k'] = df_visao_fornecedores['Total_Apenas_Servicos'].apply(
+                        lambda x: '⚠️ Atinge 20 mil' if x >= 20000 else 'Baixo Valor'
+                    )
+
+                    # Cruzamento Final: O fornecedor tem diligência feita?
+                    df_visao_fornecedores = pd.merge(
+                        df_visao_fornecedores,
+                        df_diligencias_unicas,
+                        on='CNPJ_Sanitizado',
+                        how='left',
+                        indicator=True
+                    )         
+
+                    df_visao_fornecedores['Status_Diligencia'] = df_visao_fornecedores['_merge'].apply(
+                        lambda x: '✅ Realizada' if x == 'both' else '❌ Pendente'
+                    )
+
+                    # Limpeza final para exportação
+                    df_visao_fornecedores.drop(columns=['_merge', 'CNPJ_Sanitizado', 'valor_unitario', 'quantidade_saldo', 'quantidade'], inplace=True)
+                    df_contratos.drop(columns=['CNPJ_Sanitizado'], inplace=True)
+
+                    # Buffer de memória para download
+                    buffer_excel = io.BytesIO()
+                    with pd.ExcelWriter(buffer_excel, engine='openpyxl') as writer:
+                        df_contratos.to_excel(writer, sheet_name='Analitico_Detalhado', index=False)
+                        df_visao_contratos.to_excel(writer, sheet_name='Sintetico_Contratos', index=False)
+                        df_visao_fornecedores.to_excel(writer, sheet_name='Matriz_Compliance', index=False)
+                    
+                    buffer_excel.seek(0)
+
+                st.success("Base processada com sucesso!")
+                st.download_button(
+                    label="📥 Baixar Relatório de Compliance Consolidado",
+                    data=buffer_excel,
+                    file_name="Relatorio_Compliance_Fornecedores.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+                st.markdown("### 📋 Matriz de Riscos (Fornecedores)")
+                st.dataframe(df_visao_fornecedores.head(10))
+
+            except Exception as e:
+                st.error(f"Erro no processamento dos arquivos: {e}")
+        else:
+            st.warning("⚠️ Atenção: Todos os 4 arquivos são obrigatórios para o cruzamento de dados.")
 
 # ------------------------------------------------------------------------------
 # ABA 2: VERIFICAÇÃO DE PEPs
@@ -333,5 +480,6 @@ with abas_navegacao[1]:
 
             except Exception as e:
                 st.error(f"Erro: {e}")
+
 
 
