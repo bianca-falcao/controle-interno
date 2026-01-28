@@ -61,17 +61,28 @@ def sanitizar_documento(valor: Any) -> Optional[str]:
 
 def normalizar_cpf_padrao(valor: Any) -> Optional[str]:
     """
-    Normalização padrão CPF:
-    1) remove não numéricos
-    2) adiciona zeros à esquerda até 11 dígitos
-    3) retorna None se vazio
+    Normalização robusta de CPF:
+    - Trata float vindo do Excel (remove .0)
+    - Remove não numéricos
+    - Preenche com zeros À ESQUERDA até 11 dígitos
     """
     if pd.isna(valor):
         return None
+
+    # ⚠️ CASO CRÍTICO: CPF veio como número (float) do Excel
+    if isinstance(valor, float):
+        # remove a parte decimal SEM criar zeros artificiais
+        valor = str(int(valor))
+
+    # agora sim trata como string
     limpo = re.sub(r"\D", "", str(valor))
+
     if not limpo:
         return None
+
+    # completa à ESQUERDA, nunca à direita
     return limpo.zfill(11)
+
 
 def extrair_numero_contrato(texto: str) -> Optional[str]:
     if isinstance(texto, str):
@@ -497,6 +508,7 @@ with abas_navegacao[1]:
 
             except Exception as e:
                 st.error(f"Erro: {e}")
+
 
 
 
