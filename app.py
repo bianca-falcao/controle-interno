@@ -104,15 +104,17 @@ def extrair_id_fornecedor(texto: str) -> Optional[str]:
 
 def consultar_api_pep(cpf: str) -> str:
     """
-    Consulta CPF na API PEP.
-    - CPF é normalizado (zfill 11).
-    - Retry/backoff para 403/429/5xx (CloudFront/WAF instável).
+    Consulta CPF na API PEP com robustez:
+    - CPF normalizado (zfill 11)
+    - retry/backoff para 403/405/429/5xx
+    - sem redirects
+    - força Connection: close para reduzir instabilidade em CloudFront com rajadas
     """
     cpf_tratado = normalizar_cpf_padrao(cpf)
 
     if not cpf_tratado:
         return "CPF Não Informado"
-    if cpf_tratado == '00000000000':
+    if cpf_tratado == "00000000000":
         return "CPF Zerado (Inválido)"
     if len(cpf_tratado) != 11:
         return "CPF Inválido (Tam. Incorreto)"
@@ -120,17 +122,28 @@ def consultar_api_pep(cpf: str) -> str:
     if not API_KEY:
         return "Erro: API_KEY não configurada"
 
-    session = get_session()
+    # headers por requisição (evita mutação/efeitos colaterais)
+    headers = {
+        **DEFAULT_HEADERS,
+        "Connection": "close",  # ← importante p/ reduzir bug/instabilidade com CF
+    }
 
-    tentativas = 3
+    tentativas = 4
     for i in range(tentativas):
         try:
-            r = session.get(
+            # NÃO reutilizar session aqui é mais estável em alguns ambientes
+            r = requests.get(
                 API_PEP_URL,
-                headers=DEFAULT_HEADERS,
+                headers=headers,
                 params={"cpf": cpf_tratado, "pagina": 1},
-                timeout=TIMEOUT_API_SEGUNDOS
+                timeout=TIMEOUT_API_SEGUNDOS,
+                allow_redirects=False
             )
+
+            # Se teve redirect, isso é pista forte (e evita "seguir" p/ lugar errado)
+            if r.status_code in (301, 302, 307, 308):
+                loc = r.headers.get("Location", "")
+                return f"Erro: Redirect {r.status_code} -> {loc}"
 
             if r.status_code == 200:
                 return "Sim - PEP Identificado" if r.json() else "Não consta"
@@ -138,21 +151,24 @@ def consultar_api_pep(cpf: str) -> str:
             if r.status_code == 404:
                 return "Não consta"
 
-            # CloudFront/WAF e instabilidades: tenta novamente
-            if r.status_code in (403, 429, 500, 502, 503, 504):
-                time.sleep((0.8 * (2 ** i)) + (0.1 * i))
+            # 👇 trate 405 como instabilidade também
+            if r.status_code in (403, 405, 429, 500, 502, 503, 504):
+                time.sleep((0.8 * (2 ** i)) + 0.05)  # backoff
                 continue
 
             if r.status_code == 401:
                 return "Erro: API_KEY inválida (401)"
 
-            return f"Erro HTTP {r.status_code}"
+            # Para qualquer outro, guarda um pedacinho do body (útil p/ diagnóstico)
+            body_hint = (r.text or "")[:120].replace("\n", " ").strip()
+            return f"Erro HTTP {r.status_code} - {body_hint}"
 
         except requests.RequestException:
-            time.sleep((0.8 * (2 ** i)) + (0.1 * i))
+            time.sleep((0.8 * (2 ** i)) + 0.05)
             continue
 
     return "Erro: instabilidade/limite (CloudFront)"
+
 
 def processar_parser_relatorio_complexo(arquivo_obj) -> pd.DataFrame:
     lista_dados_estruturados = []
@@ -508,6 +524,7 @@ with abas_navegacao[1]:
 
             except Exception as e:
                 st.error(f"Erro: {e}")
+
 
 
 
