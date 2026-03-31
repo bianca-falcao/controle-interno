@@ -294,7 +294,7 @@ with abas_navegacao[0]:
                     df_contratos = pd.read_excel(arquivo_contratos)
                     df_itens = pd.read_excel(arquivo_itens)
                     df_agentes = pd.read_excel(arquivo_agentes)
-                    df_diligencias = pd.read_excel(arquivo_diligencias, sheet_name="DDR e BCK")
+                    df_diligencias = pd.read_excel(arquivo_diligencias, sheet_name="CONTROLE DDR")
 
                     mapa_colunas_erp = {
                         '(a)': 'item_codigo',
