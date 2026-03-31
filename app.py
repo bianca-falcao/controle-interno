@@ -324,7 +324,7 @@ with abas_navegacao[0]:
                     df_agentes['Código'] = df_agentes['Código'].astype(str)
 
                     df_agentes['CNPJ_Sanitizado'] = df_agentes['CNPJ'].apply(sanitizar_documento)
-                    df_diligencias['CNPJ_Sanitizado'] = df_diligencias['CNPJ/CPF'].apply(sanitizar_documento)
+                    df_diligencias['CNPJ_Sanitizado'] = df_diligencias['CNPJ'].apply(sanitizar_documento)
 
                     df_diligencias_unicas = df_diligencias[['CNPJ_Sanitizado']].drop_duplicates()
 
