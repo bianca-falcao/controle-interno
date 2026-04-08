@@ -355,7 +355,7 @@ with abas_navegacao[0]:
                     cols_group_fornecedor = ['ID_Fornecedor', 'Nome fantasia', 'CNPJ', 'CNPJ_Sanitizado']
                     df_visao_fornecedores = df_contratos.groupby(cols_group_fornecedor)[cols_monetarias].sum().reset_index()
 
-                    filtro_servicos = df_contratos[df_contratos['Definição Item'] == 'Serviços']
+                    filtro_servicos = df_contratos[df_contratos['Definição Item'] == 'SE']
                     soma_apenas_servicos = filtro_servicos.groupby('ID_Fornecedor')['valor_total'].sum().reset_index()
                     soma_apenas_servicos.rename(columns={'valor_total': 'Total_Apenas_Servicos'}, inplace=True)
 
