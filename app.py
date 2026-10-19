@@ -7,6 +7,10 @@ import concurrent.futures
 import time
 import threading
 from typing import Optional, Dict, Any
+import unicodedata
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from rapidfuzz import fuzz, process
 
 # ==============================================================================
 # CONFIGURAÇÃO DA PÁGINA E ESTILOS
@@ -266,9 +270,406 @@ def processar_parser_relatorio_complexo(arquivo_obj) -> pd.DataFrame:
     return df_final
 
 # ==============================================================================
+# LISTAS RESTRITIVAS (OFAC / ONU / INTERPOL / FBI)
+# ==============================================================================
+LR_LIMIAR_PADRAO = 88            # similaridade mínima (0-100) para possível match
+LR_TIMEOUT = 90
+LR_PAUSA_INTERPOL = 1.0          # segundos entre consultas à Interpol (evita bloqueio)
+LR_CACHE_TTL = 24 * 3600         # listas baixadas ficam em cache por 24h
+
+LR_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "application/json, text/xml, text/csv, */*",
+}
+
+LR_OFAC_BASE = "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/"
+LR_URLS = {
+    "ofac_sdn": [LR_OFAC_BASE + "SDN.CSV",
+                 "https://www.treasury.gov/ofac/downloads/sdn.csv"],
+    "ofac_sdn_alt": [LR_OFAC_BASE + "ALT.CSV",
+                     "https://www.treasury.gov/ofac/downloads/alt.csv"],
+    "ofac_cons": [LR_OFAC_BASE + "CONS_PRIM.CSV",
+                  "https://www.treasury.gov/ofac/downloads/consolidated/cons_prim.csv"],
+    "ofac_cons_alt": [LR_OFAC_BASE + "CONS_ALT.CSV",
+                      "https://www.treasury.gov/ofac/downloads/consolidated/cons_alt.csv"],
+    "onu": ["https://scsanctions.un.org/resources/xml/en/consolidated.xml"],
+}
+LR_INTERPOL_URL = "https://ws-public.interpol.int/notices/v1/red"
+LR_FBI_URL = "https://api.fbi.gov/wanted/v1/list"
+
+LR_STOPWORDS = {"DA", "DE", "DO", "DAS", "DOS", "E"}
+LR_FONTES = {"ofac": "OFAC", "onu": "ONU", "interpol": "Interpol", "fbi": "FBI"}
+
+LR_COLS_OFAC_PRIM = ["ent_num", "nome", "tipo", "programa", "titulo", "call_sign", "vess_type",
+                     "tonnage", "grt", "vess_flag", "vess_owner", "remarks"]
+LR_COLS_OFAC_ALT = ["ent_num", "alt_num", "alt_type", "alt_name", "alt_remarks"]
+
+
+def lr_agora() -> str:
+    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def lr_normalizar(texto: Any) -> str:
+    """Maiúsculas, sem acento, sem pontuação, sem preposições (DA/DE/DO...)."""
+    if texto is None or (isinstance(texto, float) and pd.isna(texto)):
+        return ""
+    t = unicodedata.normalize("NFKD", str(texto))
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = re.sub(r"[^A-Za-z0-9]+", " ", t).upper()
+    return " ".join(p for p in t.split() if p not in LR_STOPWORDS)
+
+
+class LrIndiceLista:
+    """Índice de nomes de uma lista para busca aproximada (fuzzy)."""
+
+    def __init__(self, registros):
+        self.registros = [r for r in registros if lr_normalizar(r.get("nome_na_lista"))]
+        self.chaves = [lr_normalizar(r["nome_na_lista"]) for r in self.registros]
+
+    def buscar(self, nome, limiar):
+        q = lr_normalizar(nome)
+        if not q:
+            return []
+        achados = process.extract(q, self.chaves, scorer=fuzz.token_sort_ratio,
+                                  score_cutoff=limiar, limit=None)
+        melhores = {}
+        for _, score, idx in achados:
+            reg = dict(self.registros[idx])
+            reg["score"] = round(score, 1)
+            chave = (reg["fonte"], reg["lista"], reg["id_na_lista"])
+            if chave not in melhores or reg["score"] > melhores[chave]["score"]:
+                melhores[chave] = reg
+        return sorted(melhores.values(), key=lambda r: -r["score"])
+
+
+def _lr_baixar(chave: str):
+    """Baixa o arquivo tentando as URLs alternativas. Levanta erro se todas falharem."""
+    erros = []
+    for url in LR_URLS[chave]:
+        try:
+            r = requests.get(url, headers=LR_HEADERS, timeout=LR_TIMEOUT)
+            r.raise_for_status()
+            if len(r.content) < 1000:
+                raise ValueError("arquivo vazio ou inválido")
+            return r.content, url
+        except Exception as e:  # noqa: BLE001
+            erros.append(f"{url}: {e}")
+    raise RuntimeError(" | ".join(erros))
+
+
+def _lr_ler_csv_ofac(conteudo: bytes, colunas) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(conteudo), header=None, names=colunas,
+                     usecols=range(len(colunas)), dtype=str, encoding="latin-1",
+                     on_bad_lines="skip", engine="python")
+    df = df.apply(lambda s: s.str.strip())
+    return df.replace({"-0-": ""}).fillna("")
+
+
+@st.cache_data(ttl=LR_CACHE_TTL, show_spinner=False)
+def lr_carregar_ofac():
+    """SDN + Consolidated (Non-SDN), com aliases. Qualquer falha invalida a fonte toda."""
+    registros, log = [], []
+    for prim, alt, rotulo in (("ofac_sdn", "ofac_sdn_alt", "SDN"),
+                              ("ofac_cons", "ofac_cons_alt", "Consolidated (Non-SDN)")):
+        conteudo, url = _lr_baixar(prim)
+        dp = _lr_ler_csv_ofac(conteudo, LR_COLS_OFAC_PRIM)
+        dp = dp[dp["ent_num"].str.fullmatch(r"\d+")]
+        info = dp.set_index("ent_num")[["nome", "tipo", "programa", "remarks"]].to_dict("index")
+
+        def novo(ent, nome, tipo_nome, d):
+            return {
+                "fonte": "OFAC", "lista": rotulo, "id_na_lista": ent,
+                "nome_na_lista": nome, "nome_principal": d["nome"],
+                "tipo_nome": tipo_nome, "tipo_registro": d["tipo"] or "entity",
+                "programa": d["programa"], "detalhe": d["remarks"][:300],
+                "link": f"https://sanctionssearch.ofac.treas.gov/Details.aspx?id={ent}",
+            }
+
+        for ent, d in info.items():
+            registros.append(novo(ent, d["nome"], "principal", d))
+
+        conteudo_alt, _ = _lr_baixar(alt)
+        da = _lr_ler_csv_ofac(conteudo_alt, LR_COLS_OFAC_ALT)
+        for ent, nome_alt, tipo_alt in zip(da["ent_num"], da["alt_name"], da["alt_type"]):
+            d = info.get(ent)
+            if d and nome_alt:
+                registros.append(novo(ent, nome_alt, f"alias ({tipo_alt})", d))
+
+        log.append({"fonte": f"OFAC {rotulo}", "url": url, "data_hora_download": lr_agora(),
+                    "status": "OK", "qtd_registros": len(dp), "qtd_aliases": len(da),
+                    "observacao": ""})
+    return registros, log
+
+
+@st.cache_data(ttl=LR_CACHE_TTL, show_spinner=False)
+def lr_carregar_onu():
+    conteudo, url = _lr_baixar("onu")
+    root = ET.fromstring(conteudo)
+    registros = []
+    qtd = 0
+
+    def add(nome, ref, lista, tipo_nome, tipo_reg, principal, comentario):
+        if nome and nome.strip():
+            registros.append({
+                "fonte": "ONU", "lista": f"UN Consolidated - {lista}",
+                "id_na_lista": ref, "nome_na_lista": nome.strip(),
+                "nome_principal": principal, "tipo_nome": tipo_nome,
+                "tipo_registro": tipo_reg, "programa": lista,
+                "detalhe": (comentario or "")[:300],
+                "link": "https://main.un.org/securitycouncil/en/content/un-sc-consolidated-list",
+            })
+
+    for ind in root.iter("INDIVIDUAL"):
+        qtd += 1
+        partes = [ind.findtext(t) for t in ("FIRST_NAME", "SECOND_NAME", "THIRD_NAME", "FOURTH_NAME")]
+        nome = " ".join(p.strip() for p in partes if p and p.strip())
+        ref = ind.findtext("REFERENCE_NUMBER") or ind.findtext("DATAID") or ""
+        lista = ind.findtext("UN_LIST_TYPE") or ""
+        com = ind.findtext("COMMENTS1") or ""
+        add(nome, ref, lista, "principal", "Individual", nome, com)
+        add(ind.findtext("NAME_ORIGINAL_SCRIPT"), ref, lista, "escrita original", "Individual", nome, com)
+        for al in ind.findall("INDIVIDUAL_ALIAS"):
+            add(al.findtext("ALIAS_NAME"), ref, lista,
+                f"alias ({al.findtext('QUALITY') or ''})", "Individual", nome, com)
+
+    for ent in root.iter("ENTITY"):
+        qtd += 1
+        nome = (ent.findtext("FIRST_NAME") or "").strip()
+        ref = ent.findtext("REFERENCE_NUMBER") or ent.findtext("DATAID") or ""
+        lista = ent.findtext("UN_LIST_TYPE") or ""
+        com = ent.findtext("COMMENTS1") or ""
+        add(nome, ref, lista, "principal", "Entity", nome, com)
+        for al in ent.findall("ENTITY_ALIAS"):
+            add(al.findtext("ALIAS_NAME"), ref, lista,
+                f"alias ({al.findtext('QUALITY') or ''})", "Entity", nome, com)
+
+    if qtd == 0:
+        raise RuntimeError("XML da ONU sem registros (formato pode ter mudado)")
+    log = [{"fonte": "ONU - Consolidated List", "url": url, "data_hora_download": lr_agora(),
+            "status": "OK", "qtd_registros": qtd, "qtd_aliases": len(registros) - qtd,
+            "observacao": ""}]
+    return registros, log
+
+
+@st.cache_data(ttl=LR_CACHE_TTL, show_spinner=False)
+def lr_carregar_fbi():
+    itens, pagina = [], 1
+    while True:
+        r = requests.get(LR_FBI_URL, params={"page": pagina, "pageSize": 50},
+                         headers=LR_HEADERS, timeout=LR_TIMEOUT)
+        r.raise_for_status()
+        dados = r.json()
+        lote = dados.get("items") or []
+        if not lote:
+            break
+        itens.extend(lote)
+        if len(itens) >= (dados.get("total") or 0):
+            break
+        pagina += 1
+        time.sleep(0.5)
+    if not itens:
+        raise RuntimeError("API do FBI não retornou registros")
+
+    registros = []
+    for it in itens:
+        titulo = it.get("title") or ""
+        base = {
+            "fonte": "FBI", "lista": "FBI Wanted", "id_na_lista": it.get("uid") or "",
+            "nome_principal": titulo, "tipo_registro": "Individual",
+            "programa": ", ".join(it.get("subjects") or []),
+            "detalhe": re.sub(r"<[^>]+>", " ", it.get("caution") or "")[:300].strip(),
+            "link": it.get("url") or "",
+        }
+        registros.append({**base, "nome_na_lista": titulo, "tipo_nome": "principal"})
+        for alias in it.get("aliases") or []:
+            registros.append({**base, "nome_na_lista": alias, "tipo_nome": "alias"})
+
+    log = [{"fonte": "FBI Wanted", "url": LR_FBI_URL, "data_hora_download": lr_agora(),
+            "status": "OK", "qtd_registros": len(itens),
+            "qtd_aliases": len(registros) - len(itens), "observacao": ""}]
+    return registros, log
+
+
+class LrConsultaInterpol:
+    """Consulta online das Red Notices, nome a nome (forename + sobrenome)."""
+
+    def __init__(self):
+        self.sessao = requests.Session()
+        self.sessao.headers.update({**LR_HEADERS,
+                                    "Origin": "https://www.interpol.int",
+                                    "Referer": "https://www.interpol.int/"})
+
+    def buscar(self, nome, limiar):
+        tokens = lr_normalizar(nome).split()
+        if not tokens:
+            return []
+        params = {"name": tokens[-1], "resultPerPage": 160}
+        if len(tokens) > 1:
+            params["forename"] = tokens[0]
+
+        ultimo_erro = None
+        for tentativa in range(3):
+            try:
+                r = self.sessao.get(LR_INTERPOL_URL, params=params, timeout=LR_TIMEOUT)
+                if r.status_code in (403, 429, 500, 502, 503, 504):
+                    raise requests.HTTPError(f"HTTP {r.status_code}")
+                r.raise_for_status()
+                notices = (r.json().get("_embedded") or {}).get("notices") or []
+                break
+            except Exception as e:  # noqa: BLE001
+                ultimo_erro = e
+                time.sleep(LR_PAUSA_INTERPOL * (2 ** tentativa))
+        else:
+            raise RuntimeError(f"Interpol indisponível: {ultimo_erro}")
+        time.sleep(LR_PAUSA_INTERPOL)
+
+        q = lr_normalizar(nome)
+        resultados = []
+        for n in notices:
+            nome_lista = f"{n.get('forename') or ''} {n.get('name') or ''}".strip()
+            score = fuzz.token_sort_ratio(q, lr_normalizar(nome_lista))
+            if score < limiar:
+                continue
+            resultados.append({
+                "fonte": "INTERPOL", "lista": "Red Notice",
+                "id_na_lista": n.get("entity_id") or "",
+                "nome_na_lista": nome_lista, "nome_principal": nome_lista,
+                "tipo_nome": "principal", "tipo_registro": "Individual",
+                "programa": "Nacionalidades: " + ", ".join(n.get("nationalities") or []),
+                "detalhe": f"Nascimento: {n.get('date_of_birth') or 'n/d'}",
+                "link": ((n.get("_links") or {}).get("self") or {}).get("href", ""),
+                "score": round(score, 1),
+            })
+        return sorted(resultados, key=lambda r: -r["score"])
+
+
+def lr_ler_planilha(arquivo) -> pd.DataFrame:
+    if arquivo.name.lower().endswith(".csv"):
+        bruto = arquivo.getvalue()
+        for enc in ("utf-8-sig", "latin-1"):
+            try:
+                return pd.read_csv(io.BytesIO(bruto), sep=None, engine="python", dtype=str, encoding=enc)
+            except UnicodeDecodeError:
+                continue
+    return pd.read_excel(arquivo, dtype=str)
+
+
+def lr_executar_triagem(nomes, fontes, limiar, barra, status):
+    """Retorna (resultado_por_nome, ocorrencias, log_fontes, erro_fonte)."""
+    carregadores = {"ofac": lr_carregar_ofac, "onu": lr_carregar_onu, "fbi": lr_carregar_fbi}
+    indices, erro_fonte, log_fontes = {}, {}, []
+
+    for f in fontes:
+        if f in carregadores:
+            status.info(f"🔹 Carregando lista {LR_FONTES[f]}...")
+            try:
+                registros, log = carregadores[f]()
+                indices[f] = LrIndiceLista(registros)
+                log_fontes.extend(log)
+            except Exception as e:  # noqa: BLE001
+                erro_fonte[f] = str(e)
+                log_fontes.append({"fonte": LR_FONTES[f], "url": "", "data_hora_download": lr_agora(),
+                                   "status": "ERRO", "qtd_registros": None, "qtd_aliases": None,
+                                   "observacao": str(e)[:500]})
+
+    interpol = None
+    if "interpol" in fontes:
+        interpol = LrConsultaInterpol()
+        log_fontes.append({"fonte": "INTERPOL Red Notices", "url": LR_INTERPOL_URL,
+                           "data_hora_download": lr_agora(), "status": "consulta online",
+                           "qtd_registros": None, "qtd_aliases": None,
+                           "observacao": "Consulta nome a nome (primeiro nome + sobrenome)"})
+
+    resultado, ocorrencias, erros_interpol = {}, [], 0
+    total = len(nomes)
+    for i, nome in enumerate(nomes, 1):
+        barra.progress(i / total, text=f"Consultando {i}/{total}: {nome}")
+        linha = {}
+        tem_match = tem_erro = False
+        for f in fontes:
+            col = f"Status {LR_FONTES[f]}"
+            try:
+                if f == "interpol":
+                    achados = interpol.buscar(nome, limiar)
+                elif f in indices:
+                    achados = indices[f].buscar(nome, limiar)
+                else:
+                    raise RuntimeError(erro_fonte.get(f, "fonte indisponível"))
+            except Exception as e:  # noqa: BLE001
+                linha[col] = "ERRO - consultar manualmente"
+                tem_erro = True
+                if f == "interpol":
+                    erros_interpol += 1
+                    ocorrencias.append({"nome_consultado": nome, "fonte": "INTERPOL",
+                                        "detalhe": f"ERRO NA CONSULTA: {e}"})
+                continue
+
+            if achados:
+                tem_match = True
+                linha[col] = f"POSSÍVEL MATCH ({len(achados)})"
+                linha[f"Maior Score {LR_FONTES[f]}"] = achados[0]["score"]
+                ocorrencias.extend({"nome_consultado": nome, **a} for a in achados)
+            else:
+                linha[col] = "SEM OCORRÊNCIA"
+
+        linha["Resultado Triagem"] = ("ANALISAR" if tem_match
+                                      else "INCOMPLETO" if tem_erro else "SEM OCORRÊNCIA")
+        resultado[nome] = linha
+
+    if interpol is not None and erros_interpol:
+        log_fontes[-1]["observacao"] += f" | {erros_interpol} consulta(s) com erro"
+    return resultado, ocorrencias, log_fontes, erro_fonte
+
+
+def lr_gerar_excel(df_resumo, df_ocorr, df_fontes) -> bytes:
+    from openpyxl.styles import Font, PatternFill
+    cores = {"ANALISAR": "F8CBAD", "INCOMPLETO": "FFE699", "SEM OCORRÊNCIA": "C6EFCE"}
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for aba, df in (("Resumo", df_resumo), ("Ocorrencias", df_ocorr), ("Fontes", df_fontes)):
+            df.to_excel(writer, sheet_name=aba, index=False)
+            ws = writer.sheets[aba]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = PatternFill("solid", fgColor="1F4E78")
+            for col in ws.columns:
+                largura = max((len(str(c.value)) for c in col if c.value is not None), default=10)
+                ws.column_dimensions[col[0].column_letter].width = min(max(largura + 2, 12), 60)
+            if aba == "Resumo" and "Resultado Triagem" in df.columns:
+                idx = list(df.columns).index("Resultado Triagem") + 1
+                for row in ws.iter_rows(min_row=2, min_col=idx, max_col=idx):
+                    cor = cores.get(row[0].value)
+                    if cor:
+                        row[0].fill = PatternFill("solid", fgColor=cor)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def lr_gerar_modelo() -> bytes:
+    modelo = pd.DataFrame({
+        "nome": ["Fulano de Tal", "Empresa Exemplo Ltda"],
+        "documento": ["000.000.000-00", "00.000.000/0001-00"],
+        "tipo": ["PF", "PJ"],
+        "observacao": ["exemplo - apague esta linha", "exemplo - apague esta linha"],
+    })
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        modelo.to_excel(writer, sheet_name="nomes", index=False)
+        ws = writer.sheets["nomes"]
+        for col, w in zip("ABCD", (45, 22, 8, 35)):
+            ws.column_dimensions[col].width = w
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ==============================================================================
 # INTERFACE PRINCIPAL
 # ==============================================================================
-abas_navegacao = st.tabs(["📊 Fornecedores sem Diligência", "🔎 Verificação de PEPs"])
+abas_navegacao = st.tabs(["📊 Fornecedores sem Diligência", "🔎 Verificação de PEPs",
+                          "🌐 Listas Restritivas"])
 
 # ------------------------------------------------------------------------------
 # ABA 1
@@ -524,6 +925,148 @@ with abas_navegacao[1]:
 
             except Exception as e:
                 st.error(f"Erro: {e}")
+
+# ------------------------------------------------------------------------------
+# ABA 3: LISTAS RESTRITIVAS (OFAC / ONU / INTERPOL / FBI)
+# ------------------------------------------------------------------------------
+with abas_navegacao[2]:
+    st.title("🌐 Triagem em Listas Restritivas")
+    st.markdown(
+        "Consulta uma lista de nomes (pessoas ou empresas) na **OFAC** (SDN e Non-SDN), "
+        "na **Lista Consolidada da ONU**, nas **Red Notices da Interpol** e na lista de "
+        "procurados do **FBI**. A comparação é aproximada: ignora acentos, preposições e a ordem das palavras."
+    )
+
+    st.download_button(
+        "📄 Baixar planilha modelo",
+        data=lr_gerar_modelo(),
+        file_name="modelo_triagem_nomes.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="lr_modelo",
+    )
+
+    arquivo_nomes = st.file_uploader("Planilha com os nomes (.xlsx ou .csv)",
+                                     type=["xlsx", "csv"], key="upload_listas")
+
+    col_f, col_l = st.columns(2)
+    with col_f:
+        fontes_sel = st.multiselect("Fontes", options=list(LR_FONTES), default=list(LR_FONTES),
+                                    format_func=LR_FONTES.get, key="lr_fontes")
+    with col_l:
+        limiar_sel = st.slider("Similaridade mínima (%)", 70, 100, LR_LIMIAR_PADRAO, key="lr_limiar",
+                               help="Abaixo de 85 aumenta muito os homônimos; acima de 95 pode perder "
+                                    "variações de grafia.")
+
+    df_nomes, coluna_nome = None, None
+    if arquivo_nomes is not None:
+        try:
+            df_nomes = lr_ler_planilha(arquivo_nomes)
+        except Exception as e:
+            st.error(f"Falha na leitura do arquivo: {e}")
+        if df_nomes is not None and not df_nomes.empty:
+            colunas = list(df_nomes.columns)
+            padrao = next((i for i, c in enumerate(colunas)
+                           if str(c).strip().lower() in ("nome", "nomes", "razão social",
+                                                         "razao social", "name")), 0)
+            coluna_nome = st.selectbox("Coluna com os nomes", colunas, index=padrao, key="lr_coluna")
+            qtd_unicos = df_nomes[coluna_nome].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique()
+            st.caption(f"{len(df_nomes)} linha(s) | {qtd_unicos} nome(s) único(s) para consultar")
+            if "interpol" in fontes_sel and qtd_unicos > 0:
+                st.caption(f"⏱️ A Interpol é consultada nome a nome: estimativa de "
+                           f"~{max(1, round(qtd_unicos * 1.5 / 60))} min.")
+
+    if st.button("Executar Triagem", key="btn_listas"):
+        if df_nomes is None or coluna_nome is None:
+            st.warning("Faça o upload da planilha com os nomes.")
+        elif not fontes_sel:
+            st.warning("Selecione ao menos uma fonte.")
+        else:
+            nomes_serie = df_nomes[coluna_nome].fillna("").astype(str).str.strip()
+            nomes_unicos = [n for n in dict.fromkeys(nomes_serie) if n]
+            if not nomes_unicos:
+                st.warning("A coluna selecionada não tem nomes preenchidos.")
+            else:
+                status_box = st.empty()
+                barra = st.progress(0.0, text="Preparando...")
+                try:
+                    resultado, ocorrencias, log_fontes, erro_fonte = lr_executar_triagem(
+                        nomes_unicos, fontes_sel, limiar_sel, barra, status_box)
+
+                    # Resumo: planilha original + colunas da triagem
+                    cols_status = [f"Status {LR_FONTES[f]}" for f in fontes_sel]
+                    cols_score = [f"Maior Score {LR_FONTES[f]}" for f in fontes_sel]
+                    df_triagem = pd.DataFrame.from_dict(resultado, orient="index")
+                    df_triagem = df_triagem.reindex(columns=["Resultado Triagem"] + cols_status + cols_score)
+                    df_triagem = df_triagem.dropna(axis=1, how="all")
+                    df_resumo = pd.concat(
+                        [df_nomes.reset_index(drop=True),
+                         df_triagem.reindex(nomes_serie.values).reset_index(drop=True)],
+                        axis=1)
+                    df_resumo["Resultado Triagem"] = df_resumo["Resultado Triagem"].fillna("NOME VAZIO")
+
+                    cols_ocorr = ["nome_consultado", "fonte", "lista", "score", "nome_na_lista",
+                                  "tipo_nome", "nome_principal", "tipo_registro", "programa",
+                                  "id_na_lista", "detalhe", "link"]
+                    df_ocorr = pd.DataFrame(ocorrencias, columns=cols_ocorr)
+                    if not df_ocorr.empty:
+                        df_ocorr = df_ocorr.sort_values(["nome_consultado", "score"],
+                                                        ascending=[True, False], na_position="last")
+                    df_fontes = pd.DataFrame(log_fontes)
+                    df_fontes["limiar_similaridade"] = limiar_sel
+                    df_fontes["data_hora_triagem"] = lr_agora()
+
+                    st.session_state["lr_resultado"] = {
+                        "resumo": df_resumo,
+                        "ocorrencias": df_ocorr,
+                        "fontes": df_fontes,
+                        "erros": erro_fonte,
+                        "excel": lr_gerar_excel(df_resumo, df_ocorr, df_fontes),
+                        "arquivo": f"Triagem_Listas_Restritivas_{datetime.now():%Y%m%d_%H%M}.xlsx",
+                    }
+                    status_box.empty()
+                    barra.empty()
+                except Exception as e:
+                    st.error(f"Erro na triagem: {e}")
+
+    res = st.session_state.get("lr_resultado")
+    if res:
+        st.markdown("---")
+        contagem = res["resumo"]["Resultado Triagem"].value_counts()
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Linhas analisadas", len(res["resumo"]))
+        m2.metric("🔴 Analisar", int(contagem.get("ANALISAR", 0)))
+        m3.metric("🟡 Incompleto", int(contagem.get("INCOMPLETO", 0)))
+        m4.metric("🟢 Sem ocorrência", int(contagem.get("SEM OCORRÊNCIA", 0)))
+
+        for f, erro in res["erros"].items():
+            st.warning(f"⚠️ {LR_FONTES[f]} não pôde ser consultada. Os nomes ficaram como "
+                       f"'ERRO - consultar manualmente'. Detalhe: {erro[:300]}")
+        if int(contagem.get("INCOMPLETO", 0)) and "interpol" not in res["erros"]:
+            st.info("Linhas 'INCOMPLETO' tiveram alguma consulta com erro (geralmente a Interpol). "
+                    "Veja a aba Ocorrencias do Excel e consulte esses nomes manualmente.")
+
+        st.download_button(
+            "📥 Baixar Relatório de Triagem",
+            data=res["excel"],
+            file_name=res["arquivo"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="lr_download",
+        )
+
+        st.markdown("### 🔎 Possíveis matches")
+        matches = res["ocorrencias"][res["ocorrencias"]["score"].notna()]
+        if matches.empty:
+            st.success("Nenhum possível match encontrado nas fontes consultadas.")
+        else:
+            st.dataframe(matches, hide_index=True,
+                         column_config={"link": st.column_config.LinkColumn("link")})
+        st.caption("Match por nome é indício, não confirmação: valide cada caso com data de nascimento, "
+                   "nacionalidade ou documento antes de concluir.")
+
+        with st.expander("Resumo por nome"):
+            st.dataframe(res["resumo"], hide_index=True)
+        with st.expander("Fontes consultadas (trilha de auditoria)"):
+            st.dataframe(res["fontes"], hide_index=True)
 
 
 
